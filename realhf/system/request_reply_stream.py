@@ -52,7 +52,7 @@ class Payload:
     syn_reply_id: uuid.UUID = None
     ack_reply_id: uuid.UUID = None
 
-    no_syn: bool = False
+    no_syn: bool = True
 
     send_time: float = None
 
@@ -138,6 +138,9 @@ class NameResolvingRequestClient:
             f"subscribers: {name_resolve.get_subtree(names.request_reply_stream(experiment_name, trial_name, PUBSUB_BARRIER_NAME))}."
         )
 
+    def route_to(self, handler) -> int:
+        return self._handler_routing[handler]
+
     def close(self):
         self.recv_socket.close()
         for send_socket in self.send_sockets:
@@ -156,12 +159,12 @@ class NameResolvingRequestClient:
 
     def request(
         self,
-        handlers: List[str] | None = None,
+        handlers: List[str | int] | None = None,
         handle_type: str | None = None,
         datas: List[Any] | None = None,
         payloads: List[Payload] | None = None,
         verbose: bool = True,
-        no_syn: bool = False,
+        no_syn: bool = True,
     ) -> List[uuid.UUID]:
         """Send requests of type `handle_type` to all `handlers` with
         corresponding `data`.
@@ -222,7 +225,7 @@ class NameResolvingRequestClient:
 
     def call(
         self,
-        handlers: List[str] | None = None,
+        handlers: List[str | int] | None = None,
         handle_type: str | None = None,
         datas: List[Any] | None = None,
         payloads: List[Payload] | None = None,
@@ -380,7 +383,7 @@ class NameResolvingReplyServer:
                 experiment_name, trial_name, PUBSUB_BARRIER_NAME
             ),
             value=socket.gethostbyname(socket.gethostname()),
-            keepalive_ttl=60,
+            keepalive_ttl=1200,
         )
 
     def accept(self, server_send_addr: str, server_recv_addr: str):

@@ -13,6 +13,7 @@ import realhf.api.from_hf
 import realhf.base.logging as logging
 from realhf.api.core.model_api import HF_MODEL_FAMILY_REGISTRY
 from realhf.base.importing import import_module
+from realhf.base.pkg_version import is_version_less
 from realhf.impl.model.conversion.hf_registry import HFModelRegistry
 from realhf.impl.model.nn.real_llm_api import ReaLModel
 
@@ -21,9 +22,17 @@ logger = logging.getLogger("model init")
 # Import all model implementations.
 _p = re.compile(r"^(?!.*__init__).*\.py$")
 _filepath = os.path.dirname(__file__)
-import_module(os.path.join(_filepath, "backend"), _p)
 import_module(os.path.join(_filepath, "interface"), _p)
 import_module(os.path.join(_filepath, "nn"), _p)
+
+# NOTE: skip importing vLLM for now to avoid an
+# "invalid device context" issue for the 25.01 image
+if is_version_less("vllm", "0.6.4"):
+    import realhf.impl.model.backend.vllm
+import realhf.impl.model.backend.inference
+import realhf.impl.model.backend.megatron
+import realhf.impl.model.backend.mock_train
+import realhf.impl.model.backend.sglang
 
 # Set PyTorch JIT options, following Megatron-LM.
 if torch.cuda.is_available():

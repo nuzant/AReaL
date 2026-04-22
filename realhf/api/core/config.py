@@ -4,7 +4,7 @@
 
 import dataclasses
 import enum
-from typing import *
+from typing import Any, Dict, List, Optional
 
 import realhf.base.cluster as cluster
 import realhf.base.topology as topology
@@ -13,12 +13,6 @@ import realhf.base.topology as topology
 @dataclasses.dataclass
 class DatasetAbstraction:
     type_: str
-    args: Dict[str, Any] = dataclasses.field(default_factory=dict)
-
-
-@dataclasses.dataclass
-class DataLoaderAbstraction:
-    type_: str = "default"
     args: Dict[str, Any] = dataclasses.field(default_factory=dict)
 
 
@@ -76,33 +70,6 @@ class ModelName:
         return str(self)
 
 
-@dataclasses.dataclass(unsafe_hash=True)
-class ModelFamily:
-    """An identifier for the HF model type, such as llama, gpt2, etc.
-
-    :param _class: The class of the model, e.g., "llama". This is the registered
-        name in the ``register_hf_family`` function. Please refer to the files
-        in ``realhf/api/from_hf`` for a list of all supported models.
-    :type _class: str
-    :param size: The size of the model. This parameter is only used by the ``search``
-        allocation mode and will be ignored otherwise.
-    :type size: int
-    :param is_critic: Indicates whether the model is a critic or reward model,
-        as opposed to a standard LLM.
-    :type is_critic: bool
-    """
-
-    _class: str
-    size: int = 0
-    is_critic: bool = False
-
-    def __repr__(self):
-        s = f"{self._class}-{self.size}"
-        if self.is_critic:
-            s += "-critic"
-        return s
-
-
 @dataclasses.dataclass
 class ModelShardID:
     """The ID of a model shard in a specific model worker.
@@ -126,16 +93,14 @@ class ModelShardID:
     :param pp_rank: The pipeline-model parallel rank.
     :type pp_rank: int
     :param topo: The 3D parallelism topology of this model.
-    :type topo: PipeModelDataParallelTopology
+    :type topo: ProcessTopology
     """
 
     model_name: ModelName
     dp_rank: int
     mp_rank: int
     pp_rank: int
-    topo: topology.PipeModelDataParallelTopology = dataclasses.field(
-        default_factory=lambda: topology.PipeModelDataParallelTopology(1, 1, 1)
-    )
+    topo: topology.ProcessTopology
 
     def __post_init__(self):
         assert self.dp_rank >= 0 and self.mp_rank >= 0 and self.pp_rank >= 0
@@ -187,10 +152,6 @@ class StandaloneModelShardAbstraction:
     model: ModelAbstraction
     backend: ModelBackendAbstraction
     # evaluation
-    eval_datasets: Optional[List[DatasetAbstraction]] = None
-    eval_dataloader: Optional[DataLoaderAbstraction] = dataclasses.field(
-        default_factory=lambda: DataLoaderAbstraction(
-            "packed_eval", args=dict(batch_size=128)
-        )
-    )
+    eval_dataset: Optional[DatasetAbstraction] = None
+    eval_bs: int = 128
     should_instantiate: bool = True

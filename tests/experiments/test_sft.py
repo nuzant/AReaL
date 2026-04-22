@@ -5,8 +5,16 @@ from typing import *
 
 import pytest
 
-from realhf.api.quickstart.dataset import PromptAnswerDatasetConfig
-from realhf.api.quickstart.model import ModelTrainEvalConfig
+from realhf.api.cli_args import (
+    ExperimentSaveEvalControl,
+    GenerationHyperparameters,
+    MFCConfig,
+    MicroBatchSpec,
+    ModelTrainEvalConfig,
+    ParallelismConfig,
+    PPOHyperparameters,
+    PromptOnlyDatasetConfig,
+)
 from realhf.base import cluster, testing
 from realhf.experiments.common.sft_exp import SFTConfig
 from tests.experiments.utils import run_test_exp
@@ -35,7 +43,15 @@ def model_class(request):
     ],
 )
 def test_sft_xl(tmp_path_factory, tokenizer, save_path, cpu_hf_model, dp, pp, tp):
-    test_sft(tmp_path_factory, tokenizer, save_path, cpu_hf_model, dp, pp, tp)
+    test_sft(
+        tmp_path_factory,
+        tokenizer,
+        save_path,
+        cpu_hf_model,
+        dp,
+        pp,
+        tp,
+    )
 
 
 @pytest.mark.parametrize(

@@ -3,45 +3,91 @@
 # Licensed under the Apache License, Version 2.0 (the "License").
 
 import collections
+import dataclasses
+import enum
 import itertools
 import re
-from typing import *
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Hashable,
+    Iterable,
+    List,
+    Optional,
+    Set,
+    Tuple,
+    Union,
+)
 
 import numpy as np
-from omegaconf import OmegaConf
+from omegaconf import DictConfig, OmegaConf
 
+from realhf.api.cli_args import ModelTrainEvalConfig, ParallelismConfig
 from realhf.api.core.config import (
+    ModelAbstraction,
     ModelBackendAbstraction,
     ModelInterfaceType,
     ModelName,
 )
 from realhf.api.core.dfg import OffloadHook, ParamReallocHook
 from realhf.api.quickstart.device_mesh import RPCAllocation
-from realhf.api.quickstart.model import (
-    ModelTrainEvalConfig,
-    ParallelismConfig,
-    parallelism_eq,
-)
 from realhf.base import logging
-from realhf.base.topology import PipeModelDataParallelTopology
+from realhf.base.topology import (
+    DataPipeModelParallelTopology,
+    PipeDataModelParallelTopology,
+    ProcessTopology,
+)
 
 logger = logging.getLogger("Experiment Common Utils", "benchmark")
+
+
+def get_real_model_config(
+    model_path: str,
+    hf_model_family: str,
+    is_critic: bool,
+    init_from_scratch: bool,
+    init_critic_from_actor: bool,
+    dtype: Optional[str] = None,
+) -> ModelAbstraction:
+    """Make a configuration to build model."""
+    model = ModelAbstraction(
+        "real_model",
+        args=dict(
+            model_path=model_path,
+            is_critic=is_critic,
+            init_critic_from_actor=init_critic_from_actor,
+            dtype=dtype,
+            hf_model_family=hf_model_family,
+            init_from_scratch=init_from_scratch,
+        ),
+    )
+    return model
 
 
 def get_topo(
     parallel: ParallelismConfig,
     gradient_checkpointing: bool,
     gradient_accumulation_fusion: bool,
+    is_train: bool,
     max_prompt_len: Optional[int] = None,
-) -> PipeModelDataParallelTopology:
-    return PipeModelDataParallelTopology(
+) -> ProcessTopology:
+    if is_train:
+        return PipeDataModelParallelTopology(
+            num_mp=parallel.model_parallel_size,
+            num_pp=parallel.pipeline_parallel_size,
+            num_dp=parallel.data_parallel_size,
+            sequence_parallel=parallel.use_sequence_parallel,
+            gradient_checkpointing=gradient_checkpointing,
+            max_prompt_len=max_prompt_len,
+            gradient_accumulation_fusion=gradient_accumulation_fusion,
+        )
+    return DataPipeModelParallelTopology(
         num_mp=parallel.model_parallel_size,
         num_pp=parallel.pipeline_parallel_size,
         num_dp=parallel.data_parallel_size,
         sequence_parallel=parallel.use_sequence_parallel,
-        gradient_checkpointing=gradient_checkpointing,
         max_prompt_len=max_prompt_len,
-        gradient_accumulation_fusion=gradient_accumulation_fusion,
     )
 
 
@@ -56,51 +102,12 @@ def get_world_size(parallel: ParallelismConfig) -> int:
 def make_train_backend_config(
     model_cfg: ModelTrainEvalConfig, parallel_cfg: ParallelismConfig
 ):
-    if model_cfg.backend == "deepspeed":
-        return ModelBackendAbstraction(
-            "deepspeed",
-            args=dict(
-                optimizer_name="adam",
-                optimizer_config=dict(
-                    lr=model_cfg.optimizer.lr,
-                    weight_decay=model_cfg.optimizer.weight_decay,
-                    eps=model_cfg.optimizer.eps,
-                    betas=(
-                        model_cfg.optimizer.beta1,
-                        model_cfg.optimizer.beta2,
-                    ),
-                ),
-                lr_scheduler_type=model_cfg.optimizer.lr_scheduler_type,
-                warmup_steps_proportion=model_cfg.optimizer.warmup_steps_proportion,
-                min_lr_ratio=model_cfg.optimizer.min_lr_ratio,
-                zero_stage=(
-                    model_cfg.zero_stage
-                    if parallel_cfg.pipeline_parallel_size == 1
-                    else min(model_cfg.zero_stage, 1)
-                ),
-                offload_optimizer_state=model_cfg.optimizer.offload,
-                offload_param=model_cfg.offload,
-                enable_bf16=model_cfg.enable_bf16,
-                enable_fp16=model_cfg.enable_fp16,
-            ),
-        )
-    elif model_cfg.backend == "megatron":
-        if model_cfg.optimizer.offload or model_cfg.offload:
-            raise ValueError("Offload is not supported in Megatron backend.")
-        if model_cfg.zero_stage == 3:
-            raise ValueError("Zero stage 3 is not supported in Megatron backend.")
-        if model_cfg.zero_stage == 2:
-            logger.warning(
-                "Megatron does not support ZeRO stage 2. Degenerates to stage 1."
-            )
-            model_cfg.zero_stage = 1
-        megatron_args: Dict[str, Any] = OmegaConf.to_container(model_cfg.megatron)
+    if model_cfg.backend == "megatron":
+        megatron_args: Dict[str, Any] = asdict(model_cfg.megatron)
         return ModelBackendAbstraction(
             "megatron",
             args=dict(
-                enable_bf16=model_cfg.enable_bf16,
-                enable_fp16=model_cfg.enable_fp16,
-                zero_stage=model_cfg.zero_stage,
+                bf16=model_cfg.bf16,
                 optimizer=model_cfg.optimizer,
                 **megatron_args,
             ),
@@ -134,32 +141,43 @@ def make_inf_backend_config(
 def resolve_replica_ids(
     rpc_allocs: List[RPCAllocation], models: Dict[str, ModelTrainEvalConfig]
 ):
-    role_cnt = collections.defaultdict(int)
-    first_device_mesh = dict()
-    first_parallel = dict()
-    first_rpc = dict()
+    role_rpcs = collections.defaultdict(list)
     for alloc in rpc_allocs:
         rpc = alloc.rpc
-        if rpc.role not in first_device_mesh:
-            first_device_mesh[rpc.role] = alloc.device_mesh
-            first_parallel[rpc.role] = alloc.parallel
-            first_rpc[rpc.role] = rpc
+        role_rpcs[rpc.role].append(alloc)
+
+    for role, allocs in role_rpcs.items():
+        cnt = len(allocs)
+        if cnt == 1:
+            allocs[0].rpc.model_name = ModelName(role, 0)
             continue
-        model_cfg = models[rpc.role]
-        if (rpc.is_train() and first_rpc[rpc.role].is_generate()) or (
-            rpc.is_generate() and first_rpc[rpc.role].is_train()
-        ):
-            if model_cfg.vllm.hybrid_train:
-                role_cnt[rpc.role] += 1
-                rpc.model_name = ModelName(rpc.role, role_cnt[rpc.role])
+        rpcs = [alloc.rpc for alloc in allocs]
+        if any(rpc.is_train() for rpc in rpcs):
+            main_alloc = next(alloc for alloc in allocs if alloc.rpc.is_train())
+        elif any(rpc.is_inference() for rpc in rpcs):
+            main_alloc = next(alloc for alloc in allocs if alloc.rpc.is_inference())
+        else:
+            main_alloc = allocs[0]
+        main_alloc.rpc.model_name = ModelName(role, 0)
+        i = 1
+        for alloc in allocs:
+            if alloc.rpc.name == main_alloc.rpc.name:
                 continue
-        if alloc.device_mesh != first_device_mesh[rpc.role] or not parallelism_eq(
-            alloc.parallel, first_parallel[rpc.role]
-        ):
-            role_cnt[rpc.role] += 1
-            rpc.model_name = ModelName(rpc.role, role_cnt[rpc.role])
-            continue
-        assert rpc.model_name.replica_id == 0
+            same_alloc = (
+                alloc.device_mesh == main_alloc.device_mesh
+                and ParallelismConfig.parallelism_eq(
+                    alloc.parallel, main_alloc.parallel
+                )
+            )
+            if not same_alloc or (
+                alloc.rpc.is_generate()
+                and main_alloc.rpc.is_train()
+                and (models[role].vllm.hybrid_train or models[role].sglang.hybrid_train)
+            ):
+                alloc.rpc.model_name = ModelName(role, i)
+                i += 1
+            else:
+                alloc.rpc.model_name = ModelName(role, 0)
 
 
 def resolve_rpc_hooks(
@@ -181,7 +199,7 @@ def resolve_rpc_hooks(
                 if rpc.role != other.rpc.role:
                     continue
                 if (
-                    parallelism_eq(parallel, other.parallel)
+                    ParallelismConfig.parallelism_eq(parallel, other.parallel)
                     and device_mesh == other.device_mesh
                     and not (
                         model_configs[rpc.role].vllm.hybrid_train
@@ -224,58 +242,130 @@ def resolve_rpc_hooks(
             logger.info(f"Add offload hook for rpc {rpc.name} for role {rpc.role}")
 
 
-def extract_symmetric_allocation(allocation_mode: str) -> Dict | None:
-    for x, y, z in itertools.permutations(["d", "m", "p"]):
-        pattern = rf"{x}(\d+){y}(\d+){z}(\d+)"
-        m = re.match(pattern, allocation_mode)
+class AllocationType(enum.Enum):
+    DECOUPLED_vLLM = 1
+    GLOBAL_HYBRID = 2
+    MANUAL = 3
+    HEURISTIC = 4
+    SEARCH = 5
+    DECOUPLED_SGLANG = 6
+    DECOUPLED_MOCK = 7
+
+
+@dataclasses.dataclass
+class AllocationMode:
+    type_: AllocationType
+    parallel_strat: Dict[str, Dict[str, int]]
+
+    def is_decoupled(self):
+        return self.type_ in [
+            AllocationType.DECOUPLED_vLLM,
+            AllocationType.DECOUPLED_SGLANG,
+            AllocationType.DECOUPLED_MOCK,
+        ]
+
+    def is_decoupled_vllm(self):
+        return self.type_ == AllocationType.DECOUPLED_vLLM
+
+    def is_decoupled_sglang(self):
+        return self.type_ == AllocationType.DECOUPLED_SGLANG
+
+    def is_decoupled_mock(self):
+        return self.type_ == AllocationType.DECOUPLED_MOCK
+
+    def is_global_hybrid(self):
+        return self.type_ == AllocationType.GLOBAL_HYBRID
+
+    @classmethod
+    def from_str(cls, allocation_mode: str):
+        if allocation_mode == "manual":
+            return cls(AllocationType.MANUAL, None)
+        if allocation_mode == "heuristic":
+            return cls(AllocationType.HEURISTIC, None)
+        if allocation_mode == "search":
+            return cls(AllocationType.SEARCH, None)
+
+        alloc_3d = AllocationMode.extract_3d_alloc(allocation_mode)
+        alloc_hybrid = AllocationMode.extract_key_value_alloc(allocation_mode)
+        alloc_decoupled = AllocationMode.extract_decoupled_alloc(allocation_mode)
+        if alloc_decoupled:
+            if "vllm" in allocation_mode:
+                return cls(AllocationType.DECOUPLED_vLLM, alloc_decoupled)
+            elif "sglang" in allocation_mode:
+                return cls(AllocationType.DECOUPLED_SGLANG, alloc_decoupled)
+            elif "mock" in allocation_mode:
+                return cls(AllocationType.DECOUPLED_MOCK, alloc_decoupled)
+        if alloc_3d:
+            return cls(AllocationType.GLOBAL_HYBRID, alloc_3d)
+        if alloc_hybrid:
+            return cls(AllocationType.GLOBAL_HYBRID, alloc_hybrid)
+        raise NotImplementedError(f"Failed to parse allocation: {allocation_mode}")
+
+    @staticmethod
+    def extract_3d_alloc(allocation_mode: str) -> Dict | None:
+        for x, y, z in itertools.permutations(["d", "m", "p"]):
+            pattern = rf"{x}(\d+){y}(\d+){z}(\d+)"
+            m = re.match(pattern, allocation_mode)
+            if not m:
+                continue
+            a, b, c = map(int, m.groups())
+            # to be consistent with the key-value pattern
+            return {
+                "*": {
+                    x: a,
+                    y: b,
+                    z: c,
+                }
+            }
+
+    @staticmethod
+    def extract_decoupled_alloc(allocation_mode: str) -> Dict | None:
+        pattern = re.compile(
+            r"(?:(?:vllm|sglang|mock)\.(.+?)\+(.+))|(?:(.+?)\+(?:vllm|sglang|mock)\.(.+))"
+        )
+        m = pattern.match(allocation_mode)
         if not m:
-            continue
-        a, b, c = map(int, m.groups())
-        return {
-            x: a,
-            y: b,
-            z: c,
-        }
-
-
-def extract_decoupled_vllm_train_allocation(allocation_mode: str) -> Dict | None:
-    pattern = re.compile(r"(?:vllm\.(.+?)\+(.+))|(?:(.+?)\+vllm\.(.+))")
-    m = pattern.match(allocation_mode)
-    if not m:
-        return
-    if m.group(1):
-        vllm_alloc = m.group(1)
-        other_alloc = m.group(2)
-    else:
-        vllm_alloc = m.group(4)
-        other_alloc = m.group(3)
-    vllm_alloc = extract_symmetric_allocation(vllm_alloc)
-    other_alloc = extract_symmetric_allocation(other_alloc)
-    if not vllm_alloc:
-        return
-    if not other_alloc:
-        return
-    other_alloc.update({"vllm." + k: v for k, v in vllm_alloc.items()})
-    return other_alloc
-
-
-def parse_key_value_pairs(s: str):
-    pattern = re.compile(r"([^:,]+):([^:,]+)")
-    matches = pattern.findall(s)
-    if not matches:
-        return None
-    return {key: value for key, value in matches}
-
-
-def extract_key_value_allocation(
-    allocation_mode: str,
-) -> Dict[str, Dict[str, int]] | None:
-    allocs = parse_key_value_pairs(allocation_mode)
-    if not allocs:
-        return
-    for k, v in allocs.items():
-        v = extract_symmetric_allocation(v)
-        if not v:
             return
-        allocs[k] = v
-    return allocs
+        if m.group(1):
+            gen_alloc = m.group(1)
+            other_alloc = m.group(2)
+        else:
+            gen_alloc = m.group(4)
+            other_alloc = m.group(3)
+        gen_alloc = AllocationMode.extract_3d_alloc(gen_alloc)
+        if not gen_alloc:
+            return
+        other_alloc = AllocationMode.extract_3d_alloc(
+            other_alloc
+        ) or AllocationMode.extract_key_value_alloc(other_alloc)
+        if not other_alloc:
+            return
+        other_alloc.update({"gen": gen_alloc["*"]})
+        return other_alloc
+
+    @staticmethod
+    def extract_key_value_alloc(
+        allocation_mode: str,
+    ) -> Dict[str, Dict[str, int]] | None:
+        def parse_key_value_pairs(s: str):
+            pattern = re.compile(r"([^:,]+):([^:,]+)")
+            matches = pattern.findall(s)
+            if not matches:
+                return None
+            return {key: value for key, value in matches}
+
+        allocs = parse_key_value_pairs(allocation_mode)
+        if not allocs:
+            return
+        for k, v in allocs.items():
+            v = AllocationMode.extract_3d_alloc(v)
+            if not v:
+                return
+            allocs[k] = v["*"]
+        return allocs
+
+
+def asdict(cfg):
+    if isinstance(cfg, (OmegaConf, DictConfig)):
+        return OmegaConf.to_container(cfg, resolve=True)
+    return dataclasses.asdict(cfg)

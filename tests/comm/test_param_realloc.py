@@ -15,7 +15,7 @@ import pytest
 import torch
 import torch.distributed as dist
 
-from realhf.api.core.config import ModelFamily, ModelName, ModelShardID
+from realhf.api.core.config import ModelName, ModelShardID
 from realhf.api.core.data_api import MicroBatchSpec, SequenceSample
 from realhf.api.core.model_api import HF_MODEL_FAMILY_REGISTRY, ReaLModelConfig
 from realhf.base import constants, logging, testing, topology
@@ -139,7 +139,7 @@ def setup_constants_and_param_realloc(
     from_world_size = from_num_dp * from_num_mp * from_num_pp
     to_world_size = to_num_dp * to_num_mp * to_num_pp
 
-    from_topo = topology.PipeModelDataParallelTopology(
+    from_topo = topology.PipeDataModelParallelTopology(
         num_dp=from_num_dp,
         num_mp=from_num_mp,
         num_pp=from_num_pp,
@@ -148,7 +148,7 @@ def setup_constants_and_param_realloc(
         max_prompt_len=None,
         gradient_accumulation_fusion=False,
     )
-    to_topo = topology.PipeModelDataParallelTopology(
+    to_topo = topology.PipeDataModelParallelTopology(
         num_dp=to_num_dp,
         num_mp=to_num_mp,
         num_pp=to_num_pp,
@@ -496,6 +496,8 @@ def _test_para_realloc(
                         if not is_critic
                         else compute_critic_loss
                     ),
+                    loss_weight_fn=lambda: 1,
+                    token_normalize_scope="dp",
                     version_steps=i,
                 )
 

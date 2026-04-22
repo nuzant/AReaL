@@ -7,10 +7,13 @@ import functools
 import json
 import multiprocessing
 import os
-import pickle
-import re
-import socket
-import subprocess
+
+try:
+    import uvloop
+
+    uvloop.install()
+except (ModuleNotFoundError, ImportError):
+    pass
 
 import torch
 from omegaconf import OmegaConf
@@ -60,7 +63,7 @@ def main_worker(args):
         worker_index_start + args.wprocs_per_jobstep,
         args.wprocs_in_job + args.wproc_offset,
     )
-    if args.worker_type != "model_worker":
+    if args.worker_type == "master_worker":
         try:
             # CUDA_VISIBLE_DEVICES is set by slurm on PPU nodes
             # we need to remove it on CPU workers
@@ -91,8 +94,6 @@ def main_worker(args):
 
     # NOTE: Importing these will initialize DeepSpeed/CUDA devices.
     # profiler.import_profiler_registers()
-    import realhf.impl.dataset
-    import realhf.impl.model
     import realhf.system
 
     logger.debug(f"Run {args.worker_type} worker with args: %s", args)

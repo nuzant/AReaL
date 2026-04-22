@@ -21,7 +21,11 @@ import torch.utils.data
 
 from realhf.api.core.data_api import SequenceSample
 from realhf.base import constants, gpu_utils, logging, name_resolve, names, topology
-from realhf.base.topology import ParallelGrid, PipeModelDataParallelTopology
+from realhf.base.topology import (
+    DataPipeModelParallelTopology,
+    ParallelGrid,
+    PipeDataModelParallelTopology,
+)
 
 logger = logging.getLogger("testing")
 
@@ -202,9 +206,9 @@ class LocalMultiProcessTest:
 
 
 def init_global_constants(
-    num_dp,
-    num_mp,
-    num_pp,
+    num_dp=1,
+    num_mp=1,
+    num_pp=1,
     topo=None,
     model_name=None,
     msid2mwid=None,
@@ -212,19 +216,33 @@ def init_global_constants(
     gradient_checkpointing=True,
     gradient_accumulation_fusion=False,
     max_prompt_len=None,
+    is_train: bool = True,
+    expr_name=None,
+    trial_name=None,
 ):
+    expr_name = expr_name if expr_name is not None else _DEFAULT_EXPR_NAME
+    trial_name = trial_name if trial_name is not None else _DEFAULT_TRIAL_NAME
+    constants.set_experiment_trial_names(expr_name, trial_name)
     model_name = model_name if model_name is not None else MODEL_NAME
 
     if topo is None:
-        topo = PipeModelDataParallelTopology(
-            num_dp=num_dp,
-            num_mp=num_mp,
-            num_pp=num_pp,
-            sequence_parallel=sequence_parallel,
-            gradient_checkpointing=gradient_checkpointing,
-            gradient_accumulation_fusion=gradient_accumulation_fusion,
-            max_prompt_len=max_prompt_len,
-        )
+        if is_train:
+            topo = PipeDataModelParallelTopology(
+                num_dp=num_dp,
+                num_mp=num_mp,
+                num_pp=num_pp,
+                sequence_parallel=sequence_parallel,
+                gradient_checkpointing=gradient_checkpointing,
+                gradient_accumulation_fusion=gradient_accumulation_fusion,
+                max_prompt_len=max_prompt_len,
+            )
+        else:
+            topo = DataPipeModelParallelTopology(
+                num_dp=num_dp,
+                num_mp=num_mp,
+                num_pp=num_pp,
+                sequence_parallel=sequence_parallel,
+            )
         ws = num_dp * num_mp * num_pp
     else:
         ws = topo.world_size()

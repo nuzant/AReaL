@@ -32,7 +32,7 @@ class MockPipeTrainInstrSet(PipeTrainInstrSet):
     Used for testing only.
     """
 
-    optimizer: torch.optim.Optimizer
+    optim: torch.optim.Optimizer
 
     def _exec_backward_pass(
         self,
@@ -78,14 +78,19 @@ class MockPipeTrainInstrSet(PipeTrainInstrSet):
         micro_batch_id: int,
         step_id: int,
     ):
-        self.optimizer.step()
+        self.optim.step()
+
+
+class AdamWithLossScale(torch.optim.Adam):
+    def get_loss_scale(self) -> torch.Tensor:
+        return torch.tensor([1.0], device=constants.current_device())
 
 
 class MockTrainEngine(model_api.PipelinableEngine):
 
-    def __init__(self, module: ReaLModel, optimizer: torch.optim.Optimizer):
+    def __init__(self, module: ReaLModel, optimizer: AdamWithLossScale):
         self.module = module
-        self.optimizer = optimizer
+        self.optim = optimizer
 
         self.inf_engine = PipelinableInferenceEngine(module)
         if constants.pipe_parallel_world_size() > 1:
@@ -107,12 +112,14 @@ class MockTrainEngine(model_api.PipelinableEngine):
         input_: SequenceSample,
         mb_spec: MicroBatchSpec,
         loss_fn: Callable,
+        loss_weight_fn: Callable,
+        token_normalize_scope: str,
         version_steps: int,
     ):
-        self.optimizer.zero_grad()
+        self.optim.zero_grad()
         if constants.pipe_parallel_world_size() > 1:
             # Fusing the minibatched forward-backward in a pipeline training schedule.
-            instr_set = MockPipeTrainInstrSet(self.optimizer)
+            instr_set = MockPipeTrainInstrSet(self, self.optim)
             # NOTE: When training with pipeline parallel, num micro batches should be
             # larger than 2 x num_pipeline_stages to avoid idle time.
             return self.pipe_runner.train_batch(
@@ -120,10 +127,21 @@ class MockTrainEngine(model_api.PipelinableEngine):
                 input_=input_,
                 mb_spec=mb_spec,
                 loss_fn=loss_fn,
+                loss_weight_fn=loss_weight_fn,
+                token_normalize_scope=token_normalize_scope,
                 version_steps=version_steps,
             )
 
-        mb_inputs = input_.divide_into_mbs_balanced(mb_spec)
+        mb_inputs = input_.synced_data_parallel_split(mb_spec)
+        total_loss_weight = torch.tensor(
+            sum([loss_weight_fn(mb) for mb in mb_inputs]), dtype=torch.float32
+        )
+        if token_normalize_scope == "global":
+            dist.all_reduce(total_loss_weight, group=constants.data_parallel_group())
+        if total_loss_weight == 0:
+            raise model_api.ZeroTotalLossWeightException(
+                "The sum of loss weights of all micro batches is zero."
+            )
 
         if constants.parallelism_rank() == 0:
             logger.info(
@@ -147,6 +165,10 @@ class MockTrainEngine(model_api.PipelinableEngine):
                 max_seqlen=max_seqlen,
             ).logits
             loss, _stat = loss_fn(model_output, mb_input)
+            loss_scale = loss_weight_fn(mb_inputs[i]) / total_loss_weight
+            if token_normalize_scope == "global":
+                loss_scale *= constants.data_parallel_world_size()
+            loss *= loss_scale
             for k, v in _stat.items():
                 stat[k] += v
 
@@ -157,12 +179,14 @@ class MockTrainEngine(model_api.PipelinableEngine):
         self,
         input_: SequenceSample,
         mb_spec: MicroBatchSpec,
+        output_seqlens: List[List[int]] | None = None,
         post_hook: Callable[[torch.Tensor, SequenceSample], Any] | None = None,
         aggregate_fn: Callable[[List[Any]], Any] = torch.cat,
     ):
         return self.inf_engine.forward(
             input_=input_,
             mb_spec=mb_spec,
+            output_seqlens=output_seqlens,
             post_hook=post_hook,
             aggregate_fn=aggregate_fn,
         )
@@ -205,7 +229,7 @@ class MockTrainBackend(model_api.ModelBackend):
             raise ValueError("MegatronTrainBackend only supports ReaLModel.")
 
         if self.optimizer_name == "adam":
-            optimizer = torch.optim.Adam(module.parameters(), **self.optimizer_config)
+            optimizer = AdamWithLossScale(module.parameters(), **self.optimizer_config)
         else:
             raise NotImplementedError(
                 f"Optimizer {self.optimizer_name} not implemented for testing."

@@ -62,6 +62,9 @@ class ParamReallocInfo:
     param_realloc_model_group: Dict[
         ParamReallocModelPair, torch.distributed.ProcessGroup
     ]
+    param_realloc_model_cpu_group: Dict[
+        ParamReallocModelPair, torch.distributed.ProcessGroup
+    ]
     param_realloc_groups: Dict[ParamReallocPair, torch.distributed.ProcessGroup]
     param_realloc_src_ranks: Dict[ParamReallocPair, int]
     param_realloc_dst_ranks: Dict[ParamReallocPair, List[int]]
@@ -152,8 +155,8 @@ def _assign_src_to_dsts(
 
 
 def _create_param_realloc_groups(
-    from_topo: topology.PipeModelDataParallelTopology,
-    to_topo: topology.PipeModelDataParallelTopology,
+    from_topo: topology.ProcessTopology,
+    to_topo: topology.ProcessTopology,
     src: ModelName,
     dst: ModelName,
     msid2mwid: Dict[ModelShardID, int],
@@ -262,7 +265,7 @@ def _create_param_realloc_groups(
 
 
 def setup_param_realloc(
-    model_topos: Optional[Dict[str, topology.PipeModelDataParallelTopology]] = None,
+    model_topos: Optional[Dict[str, topology.ProcessTopology]] = None,
     msid2mwid: Optional[Dict[ModelShardID, int]] = None,
     param_realloc_pairs: Optional[List[Tuple[ModelName, ModelName]]] = None,
 ) -> ParamReallocInfo:
@@ -270,6 +273,7 @@ def setup_param_realloc(
     param_realloc_src_ranks = {}
     param_realloc_dst_ranks = {}
     param_realloc_model_group = {}
+    param_realloc_model_cpu_group = {}
     if param_realloc_pairs is not None:
         for src, dst in param_realloc_pairs:
             _create_param_realloc_groups(
@@ -296,11 +300,15 @@ def setup_param_realloc(
             param_realloc_model_group[ParamReallocModelPair(src, dst)] = (
                 topology.new_or_get_group(list(sorted(pair_mw_ranks)))
             )
+            param_realloc_model_cpu_group[ParamReallocModelPair(src, dst)] = (
+                topology.new_or_get_group(list(sorted(pair_mw_ranks)), backend="gloo")
+            )
     return ParamReallocInfo(
         param_realloc_groups=param_realloc_groups,
         param_realloc_src_ranks=param_realloc_src_ranks,
         param_realloc_dst_ranks=param_realloc_dst_ranks,
         param_realloc_model_group=param_realloc_model_group,
+        param_realloc_model_cpu_group=param_realloc_model_cpu_group,
     )
 
 
@@ -341,8 +349,8 @@ class ReparallelizeReceiverStep:
 def _derive_reparallelize_comm_plan(
     from_model_name: ModelName,
     to_model_name: ModelName,
-    from_topo: topology.PipeModelDataParallelTopology,
-    to_topo: topology.PipeModelDataParallelTopology,
+    from_topo: topology.ProcessTopology,
+    to_topo: topology.ProcessTopology,
     from_model_config: model_api.ReaLModelConfig,
     to_model_config: model_api.ReaLModelConfig,
     pg_info: ParamReallocInfo,

@@ -24,20 +24,19 @@ import numpy as np
 import pynvml
 import tabulate
 import torch
-import torch.distributed
 import torch.distributed as dist
 import torch.utils.data
 
-import realhf.api.core.dfg as dfg
-import realhf.api.core.system_api as system_api
-import realhf.impl.model.comm.data_transfer as data_transfer_comm
 import realhf.impl.model.comm.global_comm as global_comm
 import realhf.impl.model.comm.param_realloc as param_realloc_comm
+from realhf.api.core import data_api, dfg, model_api, system_api
 from realhf.api.core.config import ModelName
 from realhf.base import (
     constants,
     gpu_utils,
     logging,
+    name_resolve,
+    names,
     network,
     recover,
     seeding,
@@ -49,15 +48,16 @@ from realhf.base.monitor import (
     cuda_tmark,
     cuda_tmarked,
     dump_tmark_db,
-    gpu_utilization_monitor,
 )
 from realhf.impl.model.nn.real_llm_api import ReaLModel
 from realhf.impl.model.utils import cuda_graph
 from realhf.system import request_reply_stream, worker_base
+from realhf.system.data_manager import DataManager
+from realhf.system.redistributor import RedistribStep
 
 # NOTE: Register all implemented datasets and models.
-import realhf.api.core.data_api as data_api  # isort:skip
-import realhf.api.core.model_api as model_api  # isort:skip
+import realhf.impl.dataset  # isort:skip
+import realhf.impl.model  # isort:skip
 
 logger = logging.getLogger("Model Worker", "colored")
 blogger = logging.getLogger("benchmark")
@@ -111,12 +111,6 @@ class ModelWorker(worker_base.Worker):
 
         self.config = cfg
         self.model_names = [s.id.model_name for s in cfg.shards]
-        self.shard_indices = [
-            cfg.model_topos[s.id.model_name].get_rank(
-                data=s.id.dp_rank, pipe=s.id.pp_rank, model=s.id.mp_rank
-            )
-            for s in cfg.shards
-        ]
 
         self.__experiment_name = self.config.worker_info.experiment_name
         self.__trial_name = self.config.worker_info.trial_name
@@ -125,10 +119,7 @@ class ModelWorker(worker_base.Worker):
 
         self.__worker_index = cfg.worker_info.worker_index
 
-        torch.backends.cudnn.benchmark = cfg.cudnn_benchmark
-        torch.backends.cudnn.deterministic = cfg.cudnn_deterministic
-
-        seeding.set_random_seed(cfg.seed)
+        seeding.set_random_seed(cfg.base_seed + self.__worker_index)
 
         # Reveal process group identity of this worker to world.
         gpu_utils.reveal_pg_identity(
@@ -260,11 +251,12 @@ class ModelWorker(worker_base.Worker):
             msid2mwid=self.config.msid2mwid,
         )
 
-        self.__data_transfer_info = data_transfer_comm.setup_data_transfer(
+        self.data_manager = DataManager(
             model_topos=self.config.model_topos,
             msid2mwid=self.config.msid2mwid,
             data_transfer_pairs=self.config.data_transfer_pairs,
         )
+        self.data_manager.setup_process_groups()
 
         self.__param_realloc_info = param_realloc_comm.setup_param_realloc(
             model_topos=self.config.model_topos,
@@ -307,7 +299,8 @@ class ModelWorker(worker_base.Worker):
             datasets = [
                 data_api.make_dataset(
                     d,
-                    self.config.seed,
+                    # NOTE: we must use the same seed to ensure the same dataset split
+                    self.config.base_seed,
                     self.__dataset_dp_rank,
                     self.__dataset_dp_size,
                     self.config.tokenizer_name_or_path,
@@ -326,11 +319,23 @@ class ModelWorker(worker_base.Worker):
             else:
                 self.__dataset = torch.utils.data.ConcatDataset(datasets)
 
+            g = torch.Generator()
+            g.manual_seed(seeding.get_seed())
+            self.__dataloader = torch.utils.data.DataLoader(
+                self.__dataset,
+                collate_fn=data_api.SequenceSample.gather,
+                # NOTE: This is *NOT* the actual batch size for training.
+                # It is just a proper size to load data to workers.
+                batch_size=10240,
+                shuffle=True,
+                generator=g,
+            )
+
             self.__raw_samples = []
-            for tmp_sample in data_api.make_dataloader(
-                self.config.dataloader, self.__dataset
-            ):
+            for tmp_sample in self.__dataloader:
                 self.__raw_samples += tmp_sample.meta().unpack()
+
+            self.__data_generator = enumerate(self.__dataloader)
 
         self.__models: Dict[ModelName, model_api.Model] = dict()
         self.__model_is_handle: Dict[ModelName, bool] = dict()
@@ -362,12 +367,17 @@ class ModelWorker(worker_base.Worker):
                             )
 
                         # Recover indices for dynamic dataset
-                        if self.__has_dataset and hasattr(self.__dataset, "filter"):
+                        if (
+                            s.id.model_name == src_rpc.model_name
+                            and self.__has_dataset
+                            and hasattr(self.__dataset, "filter")
+                        ):
                             dataset_indices_path = os.path.join(
                                 constants.MODEL_SAVE_ROOT,
                                 constants.experiment_name(),
                                 constants.trial_name(),
-                                f"dataset_indices_{self._dp_rank}.npy",
+                                "dataset_indices",
+                                f"{self._dp_rank}.npy",
                             )
                             if os.path.exists(dataset_indices_path):
                                 indices = np.load(dataset_indices_path).tolist()
@@ -405,30 +415,27 @@ class ModelWorker(worker_base.Worker):
                     interface_impl[0]
                 )
 
-                if s.eval_datasets is not None and s.eval_dataloader is not None:
-                    eval_datasets = [
-                        data_api.make_dataset(
-                            d,
-                            self.config.seed,
-                            s.id.dp_rank,
-                            s.id.topo.get_dim("data"),
-                            self.__models[s.id.model_name].tokenizer,
-                            self.config.worker_info.experiment_name,
-                            self.config.worker_info.trial_name,
-                            cache_root=(
-                                None
-                                if not self.config.use_dataset_cache
-                                else self.config.dataset_cahce_root
-                            ),
-                        )
-                        for d in s.eval_datasets
-                    ]
-                    if len(eval_datasets) > 1:
-                        eval_dataset = torch.utils.data.ConcatDataset(eval_datasets)
-                    else:
-                        eval_dataset = eval_datasets[0]
-                    eval_dataloader = data_api.make_dataloader(
-                        s.eval_dataloader, eval_dataset
+                if s.eval_dataset is not None:
+                    eval_dataset = data_api.make_dataset(
+                        s.eval_dataset,
+                        # NOTE: we must use the same seed to ensure the same dataset split
+                        self.config.base_seed,
+                        s.id.dp_rank,
+                        s.id.topo.get_dim("data"),
+                        self.__models[s.id.model_name].tokenizer,
+                        self.config.worker_info.experiment_name,
+                        self.config.worker_info.trial_name,
+                        cache_root=(
+                            None
+                            if not self.config.use_dataset_cache
+                            else self.config.dataset_cahce_root
+                        ),
+                    )
+                    eval_dataloader = torch.utils.data.DataLoader(
+                        eval_dataset,
+                        batch_size=s.eval_bs,
+                        collate_fn=data_api.SequenceSample.gather,
+                        shuffle=False,
                     )
                 else:
                     eval_dataloader = None
@@ -451,20 +458,9 @@ class ModelWorker(worker_base.Worker):
         self.__request_cache = {}
         self.__ack_cache = {}
 
-        self.__request_queue = queue.Queue(maxsize=8)
-        self.__reply_queue = queue.Queue(maxsize=8)
+        self.__request_queue = queue.Queue(maxsize=10240)
+        self.__reply_queue = queue.Queue(maxsize=10240)
         self.__request_sample_size = dict()
-
-        # Storing data loaded from the dataset and outputs of the
-        # model function call.
-        self.__data_storage: Dict[int, data_api.SequenceSample] = {}
-
-        self.__data_sent_worker_indices: Dict[int, Dict[str, Set]] = (
-            collections.defaultdict(lambda: collections.defaultdict(set))
-        )
-        self.__data_received_worker_indices: Dict[int, Dict[str, Set]] = (
-            collections.defaultdict(lambda: collections.defaultdict(set))
-        )
 
         self.__compute_input_queues = {
             model_name: dict(
@@ -474,6 +470,13 @@ class ModelWorker(worker_base.Worker):
             )
             for model_name in self.__models.keys()
         }
+
+        # By intention, must be smaller than -1.
+        self._last_param_realloc_step = -100
+        if self.__recover_run:
+            self._last_param_realloc_step = (
+                self.__recover_info.last_step_info.global_step
+            )
 
     def __handle_one_rpc_hook(self, hook: str, hook_data: Any):
         ret = None
@@ -515,7 +518,6 @@ class ModelWorker(worker_base.Worker):
             f"RPC hook {hook} CPU time {time.perf_counter() - tik:.4f}s."
         )
         if constants.use_cuda():
-            # FIXME: temporary synchronize for debugging
             torch.cuda.synchronize()
         return ret
 
@@ -572,7 +574,10 @@ class ModelWorker(worker_base.Worker):
         elif request.handle_name == "fetch":
             dp_rank = int(re.search(r"__data(\d+)__", request.handler).group(1))
             assert self.__has_dataset
-            if request.data["first_batch"]:
+            # Fetch.
+            try:
+                self.__dataset_batch_counter, cur_sample = next(self.__data_generator)
+            except StopIteration:
                 # Upon the first fetch request, filter dataset and create dataloader.
                 eval_scores_path = os.path.join(
                     constants.MODEL_SAVE_ROOT,
@@ -584,12 +589,12 @@ class ModelWorker(worker_base.Worker):
                     constants.MODEL_SAVE_ROOT,
                     constants.experiment_name(),
                     constants.trial_name(),
-                    f"dataset_indices_{dp_rank}.npy",
+                    "dataset_indices",
+                    f"{dp_rank}.npy",
                 )
-                if (
-                    hasattr(self.__dataset, "filter")
-                    and not request.data["first_poll"]
-                    and os.path.exists(eval_scores_path)
+                os.makedirs(os.path.dirname(dataset_indices_path), exist_ok=True)
+                if hasattr(self.__dataset, "filter") and os.path.exists(
+                    eval_scores_path
                 ):
                     # Don't filter dataset on the first poll after recover.
                     with open(eval_scores_path, "r", encoding="utf-8") as f:
@@ -600,21 +605,27 @@ class ModelWorker(worker_base.Worker):
                         dataset_indices_path,
                         self.__dataset.active_indices,
                     )
-                self.__dataloader = data_api.make_dataloader(
-                    self.config.dataloader, self.__dataset
+                g = torch.Generator()
+                g = g.set_state(self.__dataloader.generator.get_state())
+                self.__dataloader = torch.utils.data.DataLoader(
+                    self.__dataset,
+                    collate_fn=data_api.SequenceSample.gather,
+                    # NOTE: This is *NOT* the actual batch size for training.
+                    # It is just a proper size to load data to workers.
+                    batch_size=10240,
+                    shuffle=True,
+                    generator=g,
                 )
                 self.__data_generator = enumerate(self.__dataloader)
-
-            # Fetch.
-            self.__dataset_batch_counter, cur_sample = next(self.__data_generator)
+                self.__dataset_batch_counter, cur_sample = next(self.__data_generator)
 
             # Defer data that has not been used in the previous epoch.
             data_loaded = []
             for x in cur_sample.unpack():
-                if x.ids[0] in self.__data_storage:
+                if self.data_manager.has_data(x.ids[0]):
                     continue
                 data_loaded.append(x)
-                self.__data_storage[x.ids[0]] = x
+                self.data_manager.store(x)
             assert len(set([x.ids[0] for x in data_loaded])) == len(data_loaded)
 
             if len(data_loaded) > 0:
@@ -625,9 +636,6 @@ class ModelWorker(worker_base.Worker):
             res = data_api.DataBatchMeta(
                 dp_rank=dp_rank,
                 meta_sample=meta_sample,
-                is_final_batch=(
-                    self.__dataset_batch_counter == len(self.__dataloader) - 1
-                ),
             )
         elif request.handle_name == "spec":
             # Raw dataset without filtering.
@@ -635,13 +643,7 @@ class ModelWorker(worker_base.Worker):
         elif request.handle_name == "clear_data_cache":
             with cuda_tmarked("clear_data_cache", CUDATimeMarkType.misc):
                 ids = request.data
-                for _id in ids:
-                    if _id in self.__data_storage:
-                        del self.__data_storage[_id]
-                    if _id in self.__data_sent_worker_indices:
-                        del self.__data_sent_worker_indices[_id]
-                    if _id in self.__data_received_worker_indices:
-                        del self.__data_received_worker_indices[_id]
+                self.data_manager.remove(ids)
                 gc.collect()
                 if (
                     self.config.cuda_cache_cleanliness
@@ -655,7 +657,7 @@ class ModelWorker(worker_base.Worker):
                     )
             logger.info(
                 "Get clear_data_cache, dump cuda tmark. "
-                f"Remaining data in local storage: {len(self.__data_storage)}. "
+                f"Remaining data in local storage: {self.data_manager.storage_size()}. "
             )
             dump_tmark_db(self.__worker_index)
             res = request_reply_stream.NoResponse()
@@ -690,9 +692,6 @@ class ModelWorker(worker_base.Worker):
                 # e.g., data transfer, parameter syncrhonization.
                 pass
             elif request.handle_name == "initialize":
-                assert not self.__model_is_handle[
-                    request.handler.model_name
-                ], request.handler.model_name
                 self.__models[request.handler.model_name] = self._backend.initialize(
                     self._model, data
                 )
@@ -746,6 +745,31 @@ class ModelWorker(worker_base.Worker):
                     assert isinstance(res, dict), res
                     res.update({f"eval_{k}": v for k, v in ret.items()})
 
+        # update param realloc step after handling post hooks
+        if request.handle_name == "train_step":
+            self._last_param_realloc_step = max(self._last_param_realloc_step + 1, 1)
+            realloc_dir = os.path.join(
+                constants.PARAM_REALLOC_PATH,
+                constants.experiment_name(),
+                constants.trial_name(),
+                model_name.role,
+            )
+            save_meta = dict(
+                model_name=model_name,
+                save_backend=False,
+                save_dir=realloc_dir,
+            )
+            self.__save_model(save_meta)
+            name = names.model_version(
+                self.__experiment_name,
+                self.__trial_name,
+                model_name.role,
+            )
+            with constants.model_scope(model_name):
+                dist.barrier(group=constants.parallelism_group())
+                if constants.parallelism_rank() == 0:
+                    name_resolve.add_subentry(name, str(self._last_param_realloc_step))
+
         self.__reply_queue.put_nowait((request, res))
         sample_count = data.bs if isinstance(data, data_api.SequenceSample) else 1
         self.__request_sample_size[request.request_id] = sample_count
@@ -770,7 +794,7 @@ class ModelWorker(worker_base.Worker):
             or self.__enable_memory_dump
         ):
             torch.cuda.synchronize()
-            torch.distributed.barrier(group=constants.parallelism_group())
+            dist.barrier(group=constants.cpu_parallelism_group())
             # pfer can be a null context if enable_profiler is False
             pfer = get_pytorch_profiler(
                 kernel_only=False, enabled=self.__enable_profiler
@@ -789,7 +813,7 @@ class ModelWorker(worker_base.Worker):
                 or self.__enable_memory_dump
             ):
                 pfer.__exit__(None, None, None)
-                torch.distributed.barrier(group=constants.parallelism_group())
+                dist.barrier(group=constants.cpu_parallelism_group())
                 torch.cuda.synchronize()
                 tok = time.perf_counter()
                 rpc_time = tok - tik
@@ -808,6 +832,17 @@ class ModelWorker(worker_base.Worker):
                     self.__performance_recorder["time"] = [rpc_time]
                 else:
                     self.__performance_recorder["time"].append(rpc_time)
+
+                with open(
+                    os.path.join(
+                        self._get_setup_logdir("performance"),
+                        f"rpc-mw{self.__worker_index}.txt",
+                    ),
+                    "a",
+                ) as f:
+                    f.write(
+                        f"rpc: {rpc.name} rank: {dist.get_rank()} time: {rpc_time}\n"
+                    )
 
             if self.__enable_profiler:
                 if self._dp_rank == 0 and self._is_dp_head:
@@ -885,7 +920,7 @@ class ModelWorker(worker_base.Worker):
             "dataset_eval_scores.json",
         )
         eval_scores = {}
-        if isinstance(res, data_api.SequenceSample):
+        if isinstance(res, data_api.SequenceSample) and constants.is_dp_head():
             if rpc.output_key_remap:
                 res.remap_keys_(rpc.output_key_remap)
             res = res.select(rpc.output_keys)
@@ -911,7 +946,7 @@ class ModelWorker(worker_base.Worker):
                     eval_scores.update(scores)
 
                 res.metadata.pop("scores")
-        dist.barrier(group=constants.parallelism_group())
+        dist.barrier(group=constants.cpu_parallelism_group())
         if len(eval_scores) > 0 and self._dp_rank == 0 and self._is_dp_head:
             with open(
                 eval_scores_path,
@@ -925,7 +960,7 @@ class ModelWorker(worker_base.Worker):
             for x in res.unpack():
                 # The input data must exist in the storage, otherwise
                 # the model function call will not run.
-                self.__data_storage[x.ids[0]].update_(x)
+                self.data_manager.update(x)
 
         # Only return meta data back to the master worker.
         if isinstance(res, data_api.SequenceSample):
@@ -934,50 +969,37 @@ class ModelWorker(worker_base.Worker):
         if constants.use_cuda():
             # Monitoring info. There's an all-gather and an all-reduce
             # over the parallelism group in this function.
-            # FIXME: temporary synchronize for debugging
             torch.cuda.synchronize()
-            if self._model.backend_name != "vllm":
-                # Since vLLM allocates GPU memory in advance, it is very
+            if (
+                self._model.backend_name != "vllm"
+                and self._model.backend_name != "sglang"
+            ):
+                # Since vLLM/SGLang allocates GPU memory in advance, it is very
                 # easy to exceed the 0.95 threshold that triggers a kill.
-                # We omit GPU stats logging for vLLM.
+                # We omit GPU stats logging for vLLM/SGLang.
                 self.__log_gpu_stats(request)
 
         self._clear_memory()
-        # FIXME: temporary synchronize for debugging
         if constants.use_cuda():
             torch.cuda.synchronize()
-        dist.barrier(group=constants.parallelism_group())
+        dist.barrier(group=constants.cpu_parallelism_group())
         return res
 
     @cuda_tmark("data_transfer", CUDATimeMarkType.comm)
     def __data_transfer_among_workers(self, hook_data: Dict[str, Any]):
         meta_sample = hook_data["meta_sample"]
-        comm_plan = data_transfer_comm.derive_data_transfer_plan(
-            keys=hook_data["keys"],
-            global_ids=meta_sample.ids,
-            consumer_name=hook_data["target"],
-            consumer_mapping=hook_data["target_mapping"],
-            producer_names=hook_data["producer_names"],
-            producer_mappings=hook_data["producer_mappings"],
-            data_transfer_info=self.__data_transfer_info,
-        )
 
-        data_transfer_comm.run_data_transfer(
-            comm_plan=comm_plan,
-            meta_samples={x.ids[0]: x for x in meta_sample.unpack()},
-            storage=self.__data_storage,
-            sent_worker_idx_table=self.__data_sent_worker_indices,
-            received_worker_idx_table=self.__data_received_worker_indices,
-        )
+        plan = [RedistribStep(**json.loads(x)) for x in hook_data["plan"]]
+        self.data_manager.redistribute(meta_sample, plan=plan)
 
         if hook_data["target"] in self.__models:
             with constants.model_scope(hook_data["target"]):
-                local_ids = [
-                    meta_sample.ids[i]
-                    for i in hook_data["target_mapping"][self._dp_rank]
-                ]
+                local_ids = hook_data["partitioned_ids"][self._dp_rank]
             r = data_api.SequenceSample.gather(
-                [self.__data_storage[_id] for _id in local_ids],
+                [
+                    self.data_manager.get(_id).to_device(constants.current_device())
+                    for _id in local_ids
+                ],
                 keys=meta_sample.keys,
             )
             self.__compute_input_queues[hook_data["target"]][
@@ -988,8 +1010,8 @@ class ModelWorker(worker_base.Worker):
         from_model_name: ModelName = hook_data["from_model_name"]
         to_model_name: ModelName = hook_data["to_model_name"]
 
-        from_topo: topology.PipeModelDataParallelTopology = hook_data["from_topo"]
-        to_topo: topology.PipeModelDataParallelTopology = hook_data["to_topo"]
+        from_topo: topology.ProcessTopology = hook_data["from_topo"]
+        to_topo: topology.ProcessTopology = hook_data["to_topo"]
 
         # NOTE: For the convenience of future developement, we
         # run parameter reallocation with disk save-load by default.
@@ -1002,7 +1024,7 @@ class ModelWorker(worker_base.Worker):
             with constants.model_scope(from_model_name):
                 from_model_ranks = constants.parallelism_group_ranks()
             if not param_realloc_comm.is_trainable(from_model_name):
-                if torch.distributed.get_rank() not in from_model_ranks:
+                if dist.get_rank() not in from_model_ranks:
                     return
                 if not isinstance(self.__unwrapped_models[from_model_name], ReaLModel):
                     # We can only release the memory of ReaLModel,
@@ -1028,7 +1050,7 @@ class ModelWorker(worker_base.Worker):
                     save_dir=realloc_dir,
                 )
                 self.__save_model(save_meta)
-            g = self.__param_realloc_info.param_realloc_model_group[
+            g = self.__param_realloc_info.param_realloc_model_cpu_group[
                 param_realloc_comm.ParamReallocModelPair(from_model_name, to_model_name)
             ]
             dist.barrier(group=g)
@@ -1040,7 +1062,7 @@ class ModelWorker(worker_base.Worker):
                 self.__load_model(load_meta)
                 # Remove the reallocated checkpoint.
                 with constants.model_scope(to_model_name):
-                    dist.barrier(constants.parallelism_group())
+                    dist.barrier(constants.cpu_parallelism_group())
                     if constants.parallelism_rank() == 0:
                         shutil.rmtree(realloc_dir, ignore_errors=True)
                         os.makedirs(realloc_dir, exist_ok=True)
@@ -1108,7 +1130,7 @@ class ModelWorker(worker_base.Worker):
                             ).is_symlink():
                                 os.unlink(save_root / fn)
                     shutil.rmtree(save_dir, ignore_errors=True)
-            dist.barrier(constants.parallelism_group())
+            dist.barrier(constants.cpu_parallelism_group())
             self._interface.save(self._model, save_dir)
             # The `save` method of the interface may be empty.
             # We only save the backend state if the parameters have been indeed saved.
@@ -1136,22 +1158,21 @@ class ModelWorker(worker_base.Worker):
     def __load_model(self, hook_data: Dict):
         tik = time.perf_counter()
         with constants.model_scope(hook_data["model_name"]):
-            from realhf.impl.model.backend.vllm import (
-                vLLMGenerationBackend,
-                vLLMGenerationEngine,
-            )
-
             if isinstance(self._model.module, torch.nn.Identity) and isinstance(
-                self._backend, vLLMGenerationBackend
+                self._backend,
+                (
+                    model_api.ALL_BACKEND_CLASSES["sglang"],
+                    model_api.ALL_BACKEND_CLASSES["vllm"],
+                ),
             ):
-                # The uninitialized vLLM model. Since we create the model
-                # inside the vLLM backend, the initial param realloc before
+                # The uninitialized vLLM/SGLang model. Since we create the model
+                # inside the vLLM/SGLang backend, the initial param realloc before
                 # backend initialization can be ignored.
                 return
-            if self._model.backend_name == "vllm":
+            if self._model.backend_name in ["vllm", "sglang"]:
                 if constants.parallelism_rank() == 0:
-                    logger.info("Updating vLLM model from disk.")
-                module: vLLMGenerationEngine = self._model.module
+                    logger.info(f"Updating {self._model.backend_name} model from disk.")
+                module = self._model.module
                 module.update_weights_from_disk(hook_data["load_dir"])
             else:
                 module: ReaLModel = self.__unwrapped_models[hook_data["model_name"]]
@@ -1162,7 +1183,7 @@ class ModelWorker(worker_base.Worker):
             t = torch.tensor(
                 float(time.perf_counter() - tik),
                 dtype=torch.float64,
-                device=module.device,
+                device=constants.current_device(),
             )
             dist.all_reduce(
                 t, op=dist.ReduceOp.MAX, group=constants.parallelism_group()
@@ -1176,11 +1197,12 @@ class ModelWorker(worker_base.Worker):
     @cuda_tmark("post_response", CUDATimeMarkType.misc)
     def maybe_post_responses(self):
         ready_to_post = []
-        try:
-            request, res = self.__reply_queue.get_nowait()
-            ready_to_post.append((request, res))
-        except queue.Empty:
-            pass
+        while True:
+            try:
+                request, res = self.__reply_queue.get_nowait()
+                ready_to_post.append((request, res))
+            except queue.Empty:
+                break
 
         batch_size = sample_size = 0
         for request, res in ready_to_post:
@@ -1334,7 +1356,6 @@ class ModelWorker(worker_base.Worker):
         self.__models.clear()
         self.__backends.clear()
         self.__interfaces.clear()
-        self.__data_storage.clear()
 
         # Reset model worker states.
         self.__dist_env_resolved = False

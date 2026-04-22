@@ -18,6 +18,7 @@ import realhf.base.recover as recover
 import realhf.scheduler.client as sched_client
 import realhf.system as system
 from realhf.scheduler.client import JobException, JobState
+from realhf.scheduler.evaluator import AutomaticEvaluator
 
 logger = logging.getLogger("main", "system")
 
@@ -85,9 +86,16 @@ def main_start(args, recover_count: int = 0):
     # Run initial_setup to go through all sanity checks.
     try:
         exp_cfg = experiment.initial_setup()
+        assert isinstance(exp_cfg, config_package.ExperimentConfig)
         exp_cfg.lazy_init()
     except Exception as e:
         raise RuntimeError("Experiment initial setup failed.") from e
+
+    evaluator = (
+        AutomaticEvaluator(exp_cfg.evaluator, exp_cfg.wandb)
+        if exp_cfg.auto_eval
+        else None
+    )
 
     if args.mode == "local":
         assert (
@@ -152,7 +160,8 @@ def main_start(args, recover_count: int = 0):
         CLUSTER_SPEC_PATH=cluster_spec_path,
         REAL_RECOVER_RUN="1" if is_recover_run else "0",
         REAL_SAVE_RECOVER_STATES="1" if save_recover_states else "0",
-        REAL_MATH_METADATA_PATH=os.getenv("REAL_MATH_METADATA_PATH", ""),
+        FUNCTIONCALL_SERVICE_DOMAIN=os.getenv("FUNCTIONCALL_SERVICE_DOMAIN", ""),
+        REAL_ETCD_ADDR=os.getenv("REAL_ETCD_ADDR", "localhost:2379"),
     )
     for k, v in BASE_ENVIRONS.items():
         os.environ[k] = v
@@ -167,6 +176,7 @@ def main_start(args, recover_count: int = 0):
         expr_name=expr_name,
         trial_name=trial_name,
         schedule_strategy=args.schedule_strategy,
+        evaluator=evaluator,
     )
 
     setup = experiment.scheduling_setup()
@@ -301,7 +311,7 @@ def main_find_config(args):
 
 
 def main_profile_layers(args):
-    from realhf.api.core.model_api import ModelFamily
+    from realhf.api.cli_args import ModelFamily
 
     _main_profile_layers(
         ModelFamily(args.model_class, args.model_size, args.is_critic),
@@ -310,7 +320,7 @@ def main_profile_layers(args):
 
 
 def _main_profile_layers(model_family, model_path):
-    from realhf.api.core.model_api import ModelFamily
+    from realhf.api.cli_args import ModelFamily
     from realhf.base.slurm_utils import check_slurm_availability
     from realhf.base.testing import clear_name_resolve
 

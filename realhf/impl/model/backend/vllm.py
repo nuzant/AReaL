@@ -29,9 +29,9 @@ except ModuleNotFoundError:
         pass
 
 
+from realhf.api.cli_args import vLLMConfig
 from realhf.api.core import data_api, model_api
-from realhf.api.quickstart.model import vLLMConfig
-from realhf.base import constants, logging
+from realhf.base import constants, logging, seeding
 
 logger = logging.getLogger("vLLM backend")
 
@@ -165,8 +165,8 @@ class vLLMGenerationEngine(model_api.PipelinableEngine, LLM):
 
 @dataclasses.dataclass
 class vLLMGenerationBackend(vLLMConfig, model_api.ModelBackend):
-    seed: int = 0
     model_path: str = ""
+    dtype: str = "bfloat16"
 
     def _initialize(
         self, model: model_api.Model, spec: model_api.FinetuneSpec
@@ -187,8 +187,8 @@ class vLLMGenerationBackend(vLLMConfig, model_api.ModelBackend):
             skip_tokenizer_init=False,
             trust_remote_code=True,
             max_model_len=self.max_model_len,
-            seed=self.seed,
-            dtype=torch.float16,
+            seed=seeding.get_seed(),
+            dtype=getattr(torch, self.dtype),
             kv_cache_dtype=self.kv_cache_type,
             device=constants.current_device(),
             # Parallelism.
@@ -207,6 +207,8 @@ class vLLMGenerationBackend(vLLMConfig, model_api.ModelBackend):
             max_seq_len_to_capture=self.max_seq_len_to_capture,
             enable_prefix_caching=self.enable_prefix_caching,
             gpu_memory_utilization=self.gpu_memory_utilization,
+            disable_sliding_window=self.disable_sliding_window,
+            enable_chunked_prefill=self.enable_chunked_prefill,
             disable_custom_all_reduce=True,
             disable_async_output_proc=False,
             disable_log_stats=False,

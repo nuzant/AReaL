@@ -18,7 +18,7 @@ def model_class(request):
     return request.param
 
 
-def run_model_worker(cfg, mw, barrier):
+def run_model_worker(cfg, mw, barrier, expr_name=None):
     constants.set_force_cpu(True)
     # Register all datasets and models
     import realhf.impl.dataset  # isort: skip
@@ -27,7 +27,7 @@ def run_model_worker(cfg, mw, barrier):
     from realhf.system.model_worker import ModelWorker
 
     system_api.ALL_EXPERIMENT_CLASSES = {}
-    register_experiment(testing._DEFAULT_EXPR_NAME, lambda: cfg)
+    register_experiment(expr_name or testing._DEFAULT_EXPR_NAME, lambda: cfg)
 
     worker = ModelWorker()
     logger.info("Configuring model worker...")
@@ -44,7 +44,11 @@ def run_model_worker(cfg, mw, barrier):
             initd = True
 
 
-def run_test_exp(exp_cfg: Experiment, expr_name=None, trial_name=None):
+def run_test_exp(
+    exp_cfg: Experiment,
+    expr_name=None,
+    trial_name=None,
+):
     constants.set_force_cpu(True)
     # Register all datasets and models
     import realhf.impl.dataset  # isort: skip
@@ -53,7 +57,7 @@ def run_test_exp(exp_cfg: Experiment, expr_name=None, trial_name=None):
     from realhf.system.master_worker import MasterWorker
 
     system_api.ALL_EXPERIMENT_CLASSES = {}
-    register_experiment(testing._DEFAULT_EXPR_NAME, lambda: exp_cfg)
+    register_experiment(expr_name or testing._DEFAULT_EXPR_NAME, lambda: exp_cfg)
 
     # Get worker configurations
     exp_setup = exp_cfg.initial_setup()
@@ -74,7 +78,13 @@ def run_test_exp(exp_cfg: Experiment, expr_name=None, trial_name=None):
     testcase = testing.LocalMultiProcessTest(
         world_size=len(exp_setup.model_worker),
         func=[
-            functools.partial(run_model_worker, cfg=exp_cfg, mw=mw, barrier=barrier)
+            functools.partial(
+                run_model_worker,
+                cfg=exp_cfg,
+                mw=mw,
+                barrier=barrier,
+                expr_name=expr_name,
+            )
             for mw in exp_setup.model_worker
         ],
         expr_name=expr_name or testing._DEFAULT_EXPR_NAME,
@@ -85,14 +95,13 @@ def run_test_exp(exp_cfg: Experiment, expr_name=None, trial_name=None):
     testcase.start()
 
     # Run the master worker.
-    for _ in range(100):
-        for _ in range(100):
-            if mas.status == WorkerServerStatus.PAUSED:
-                break
-            if not initd:
-                logger.info("Running master worker lazy initialization...")
-            mas._poll()
-            if not initd:
-                logger.info("Running master worker lazy initialization... Done.")
-                initd = True
-        testcase.wait(timeout=0.1)
+    for _ in range(int(1e4)):
+        if mas.status == WorkerServerStatus.PAUSED:
+            break
+        if not initd:
+            logger.info("Running master worker lazy initialization...")
+        mas._poll()
+        if not initd:
+            logger.info("Running master worker lazy initialization... Done.")
+            initd = True
+    testcase.wait(timeout=0.1)

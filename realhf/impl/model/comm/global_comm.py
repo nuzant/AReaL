@@ -26,7 +26,7 @@ class NCCLProcessGroupInfo:
 
 def filter_match_mwids(
     model_name: ModelName,
-    topo: topology.PipeModelDataParallelTopology,
+    topo: topology.ProcessTopology,
     msid2mwid: Dict[ModelShardID, int],
     **conditions,
 ) -> List[int]:
@@ -49,7 +49,7 @@ def setup_global_comm(
     expr_name: str,
     trial_name: str,
     worker_index: int,
-    model_topos: Optional[Dict[str, topology.PipeModelDataParallelTopology]] = None,
+    model_topos: Optional[Dict[str, topology.ProcessTopology]] = None,
     msid2mwid: Optional[Dict[ModelShardID, int]] = None,
     backend: str = "nccl",
 ) -> NCCLProcessGroupInfo:
@@ -136,6 +136,8 @@ def setup_global_comm(
     for model_name, ranks in mw_ranks.items():
         model_groups[model_name] = topology.new_or_get_group(ranks, backend=backend)
         constants.set_parallelism_group(model_name, model_groups[model_name], ranks)
+        cpu_group = topology.new_or_get_group(ranks, backend="gloo")
+        constants.set_cpu_parallelism_group(model_name, cpu_group)
 
     self_group = None
     for i in range(world_size):

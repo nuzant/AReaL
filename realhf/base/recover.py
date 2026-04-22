@@ -35,6 +35,8 @@ class RecoverInfo:
     ckpt_ctl_info: Dict
     eval_ctl_info: Dict
 
+    data_loading_dp_idx: int
+
     hash_vals_to_ignore: List[int] = dataclasses.field(default_factory=list)
 
 
@@ -103,6 +105,8 @@ def discover_ckpt(
         )
         model_ckpt_dirs = []
         for role in os.listdir(model_save_dir):
+            if "dataset_indices" in role:
+                continue
             if not os.path.isdir(model_save_dir / role):
                 continue
             ckpt_dir = (

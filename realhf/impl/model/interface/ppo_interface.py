@@ -7,7 +7,7 @@ import dataclasses
 import functools
 import itertools
 import time
-from typing import Dict, Optional, Tuple
+from typing import Dict, Literal, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -18,7 +18,7 @@ import realhf.base.logging as logging
 import realhf.impl.model.utils.ppo_functional as ppo_functional
 from realhf.api.core.data_api import MicroBatchSpec, SequenceSample
 from realhf.base.datapack import flat2d
-from realhf.impl.model.interface.math_parser import parse_lines_in_parallel
+from realhf.impl.dataset.math_parser import parse_lines_in_parallel
 from realhf.impl.model.nn.real_llm_api import ReaLModel
 from realhf.impl.model.nn.real_llm_generate import concat_prompt_to_generation_output
 from realhf.impl.model.utils.functional import (
@@ -37,7 +37,7 @@ def get_score(prompt_ids, generated, query_ids, tokenizer):
         generated, clean_up_tokenization_spaces=False, skip_special_tokens=True
     )
     query_id_strs = [query_id.split("@")[0] for query_id in query_ids]
-    return parse_lines_in_parallel(prompt_strs, seq_strs, query_id_strs, max_workers=22)
+    return parse_lines_in_parallel(seq_strs, query_id_strs)
 
 
 def topk(scores, gen_lengths, k) -> list:
@@ -186,6 +186,7 @@ class PPOActorInterface(model_api.ModelInterface):
     mask_too_long: bool = False
     use_dense_reward: bool = False
     reward_delta: bool = True
+    token_normalize_scope: Literal["global", "dp"] = "global"
 
     def __post_init__(self):
         if self.adaptive_kl_ctl:
@@ -259,7 +260,7 @@ class PPOActorInterface(model_api.ModelInterface):
             offset += x[0]
         assert offset == sum(x[0] for x in input_.seqlens["packed_prompts"])
 
-        if model.backend_name != "vllm":
+        if model.backend_name not in ["vllm", "sglang"]:
             # Replicate prompts
             grouped_input = SequenceSample.from_default(
                 ids=list(range(input_.bs * self.generation_size)),
@@ -286,7 +287,7 @@ class PPOActorInterface(model_api.ModelInterface):
             gconfig=self.gconfig,
             mb_spec=mb_spec,
         )
-        if res is None:
+        if res is None or res[0] is None:
             return None
 
         gen_tokens, logprobs, _ = res
@@ -443,13 +444,13 @@ class PPOActorInterface(model_api.ModelInterface):
         )
 
         res = SequenceSample(
-            keys=["packed_ref_logprobs"],
+            keys=["logprobs"],
             ids=input_.ids,
-            dtypes=dict(packed_ref_logprobs=torch.float16),
-            trailing_shapes=dict(packed_ref_logprobs=()),
-            data=dict(packed_ref_logprobs=logprobs),
+            dtypes=dict(logprobs=model.module.dtype),
+            trailing_shapes=dict(logprobs=()),
+            data=dict(logprobs=logprobs),
             seqlens=dict(
-                packed_ref_logprobs=[
+                logprobs=[
                     [x - 1 for x in slen] for slen in input_.seqlens["packed_input_ids"]
                 ]
             ),
@@ -614,9 +615,11 @@ class PPOActorInterface(model_api.ModelInterface):
         )
         # NOTE: We cannot randomly shuffle data here because
         # data must have the same shape across different pipeline stages.
-        datas = input_.split(
-            self.n_minibatches,
-            min_size=input_.bs // self.n_minibatches,
+        datas, *_ = input_.split(MicroBatchSpec(n_mbs=self.n_minibatches))
+        logger.info(
+            f"PPO minibatch split (size {self.n_minibatches}): "
+            f"#seqs: {[s.bs for s in datas]}, "
+            f"#tokens: {[sum([sum(lens) for lens in s.seqlens[s._get_split_key()]]) for s in datas]}"
         )
 
         if self.use_dense_reward:
@@ -672,6 +675,7 @@ class PPOActorInterface(model_api.ModelInterface):
 
         # Run mini-batched PPO training!
         train_stats = collections.defaultdict(lambda: 0)
+
         for data in datas:
             stats = module.train_batch(
                 input_=data,
@@ -685,6 +689,8 @@ class PPOActorInterface(model_api.ModelInterface):
                     early_stop_kl=self.early_stop_kl,
                     temperature=self.gconfig.temperature,
                 ),
+                loss_weight_fn=lambda x: x.data["ppo_loss_mask"].count_nonzero(),
+                token_normalize_scope=self.token_normalize_scope,
             )
 
             if stats:
@@ -888,6 +894,7 @@ class PPOCriticInterface(model_api.ModelInterface):
     mask_too_long: bool = False
     use_dense_reward: bool = False
     reward_delta: bool = True
+    token_normalize_scope: Literal["global", "dp"] = "global"
 
     def __post_init__(self):
         if self.adaptive_kl_ctl:
@@ -942,7 +949,7 @@ class PPOCriticInterface(model_api.ModelInterface):
             data=dict(packed_input_ids=input_.data["packed_input_ids"]),
         )
         if self.disable_value:
-            scores = torch.zeros_like(input_.data["packed_input_ids"]).to(torch.float16)
+            scores = input_.data["packed_input_ids"].new_zeros(dtype=module.dtype)
         else:
             scores = module.forward(input_=input_flattend, mb_spec=mb_spec)
 
@@ -957,7 +964,7 @@ class PPOCriticInterface(model_api.ModelInterface):
         res = SequenceSample(
             keys=["values"],
             ids=input_.ids,
-            dtypes=dict(values=torch.float16),
+            dtypes=dict(values=module.dtype),
             trailing_shapes=dict(values=()),
             data=dict(values=scores),
             seqlens=dict(values=input_.seqlens["packed_input_ids"]),
@@ -1086,9 +1093,11 @@ class PPOCriticInterface(model_api.ModelInterface):
         )
         # NOTE: We cannot randomly shuffle data here because
         # data must have the same shape across different pipeline stages.
-        datas = input_.split(
-            self.n_minibatches,
-            min_size=input_.bs // self.n_minibatches,
+        datas, *_ = input_.split(MicroBatchSpec(n_mbs=self.n_minibatches))
+        logger.info(
+            f"PPO minibatch split (size {self.n_minibatches}): "
+            f"#seqs: {[s.bs for s in datas]}, "
+            f"#tokens: {[sum([sum(lens) for lens in s.seqlens[s._get_split_key()]]) for s in datas]}"
         )
 
         # Logging.
@@ -1111,6 +1120,8 @@ class PPOCriticInterface(model_api.ModelInterface):
                     kl_adapter=self.kl_adapter,
                     rms=None if not self.value_norm else self.rms,
                 ),
+                loss_weight_fn=lambda x: x.data["ppo_loss_mask"].count_nonzero(),
+                token_normalize_scope=self.token_normalize_scope,
             )
 
             if stats:

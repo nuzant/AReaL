@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from realhf.api.core.config import ModelName
     from realhf.api.core.system_api import ModelShardID
-    from realhf.base.topology import ParallelGrid, PipeModelDataParallelTopology
+    from realhf.base.topology import ParallelGrid, ProcessTopology
 
 
 class GlobalMemoryBuffer:
@@ -59,10 +59,9 @@ class GlobalMemoryBuffer:
         return res
 
 
-# 30 minutes. Transferring super-large batches via NCCL bcast
-# for the first time may consumer over 600 secs, which is the
-# pytorch's default. Increase this value to 30 minutes.
-NCCL_DEFAULT_TIMEOUT = datetime.timedelta(seconds=1800)
+# For large models, generation may consume more than 3600s.
+# We set a large value to avoid NCCL timeout issues during generaiton.
+NCCL_DEFAULT_TIMEOUT = datetime.timedelta(seconds=7200)
 
 # We may want to use CPU for testing even when CUDA is available.
 TORCH_FORCE_CPU = False
@@ -80,6 +79,7 @@ TRITON_CACHE_PATH = f"{LOCAL_CACHE_DIR}/.cache/{getpass.getuser()}/triton"
 DATASET_CACHE_PATH = f"{cluster_spec.fileroot}/.cache/{getpass.getuser()}/datasets"
 PROFILER_CACHE_PATH = f"{cluster_spec.fileroot}/.cache/{getpass.getuser()}/profiler"
 PARAM_REALLOC_PATH = f"{cluster_spec.fileroot}/.cache/{getpass.getuser()}/param_realloc"
+SGLANG_CACHE_PATH = f"{cluster_spec.fileroot}/.cache/{getpass.getuser()}/sglang"
 TORCH_EXTENSIONS_DIR = (
     f"{cluster_spec.fileroot}/.cache/{getpass.getuser()}/torch/extensions"
 )
@@ -105,7 +105,6 @@ BASE_ENVIRONS = {
     # "TORCH_SHOW_CPP_STACKTRACES": "1",
     # "RAY_DEDUP_LOGS": "0",  # disable ray log deduplication
     "CUDA_DEVICE_MAX_CONNECTIONS": "1",
-    "PYTHONUSERBASE": "/nonsense",  # a random PYTHONUSERBASE to avoid local user site-packages interference
     "OMP_NUM_THREADS": str(min(os.cpu_count(), 32)),
     # torch.distributed.all_reduce does not free the input tensor until
     # the synchronization point. This causes the memory usage to grow
@@ -138,7 +137,6 @@ if cluster_spec.name == "wa180":
     BASE_ENVIRONS.update(PPU_ENVIRONS)
 elif cluster_spec.name == "na132":
     # Specific environment variable for h800 cluster na132
-    # FIXME: change to general cases for open source repo
     NV_ENVIRONS = {
         "NCCL_SOCKET_IFNAME": "bond0",
         "NCCL_NET_PLUGIN": "",
@@ -167,6 +165,7 @@ os.makedirs(DATASET_CACHE_PATH, exist_ok=True)
 os.makedirs(PROFILER_CACHE_PATH, exist_ok=True)
 os.makedirs(TORCH_EXTENSIONS_DIR, exist_ok=True)
 os.makedirs(QUICKSTART_EXPR_CACHE_PATH, exist_ok=True)
+os.makedirs(SGLANG_CACHE_PATH, exist_ok=True)
 
 # _model_name will be changed in the model_scope context manager
 _model_name: "ModelName" = None
@@ -177,6 +176,9 @@ _trial_name = None
 
 _grids: Dict["ModelName", "ParallelGrid"] = {}
 _pgroups: Dict["ModelName", Any] = (
+    {}
+)  # torch.distributed.ProcessGroup, not type hint here to avoid importing torch
+_cpu_pgroups: Dict["ModelName", Any] = (
     {}
 )  # torch.distributed.ProcessGroup, not type hint here to avoid importing torch
 _pgroup_ranks: Dict["ModelName", List[int]] = {}
@@ -261,6 +263,13 @@ def set_parallelism_group(model_name: "ModelName", pgroup, ranks):
     _pgroup_ranks[model_name] = ranks
 
 
+def set_cpu_parallelism_group(model_name: "ModelName", pgroup):
+    global _cpu_pgroups
+    if model_name in _cpu_pgroups:
+        raise RuntimeError(f"Parallelism group for model {model_name} is already set.")
+    _cpu_pgroups[model_name] = pgroup
+
+
 def set_self_group(pgroup):
     global _self_group
     if _self_group is not None:
@@ -270,7 +279,7 @@ def set_self_group(pgroup):
 
 def set_rank_mapping(
     model_name: "ModelName",
-    topo: "PipeModelDataParallelTopology",
+    topo: "ProcessTopology",
     msid2mwid: Optional[Dict["ModelShardID", int]] = None,
 ):
     global _rank_mapping
@@ -318,8 +327,8 @@ def gradient_accumulation_fusion() -> bool:
         import fused_weight_gradient_mlp_cuda
     except ImportError:
         _grad_accum_fusion_available = False
-    return (
-        _grad_accum_fusion_available and grid().topology().gradient_accumulation_fusion
+    return _grad_accum_fusion_available and getattr(
+        grid().topology(), "gradient_accumulation_fusion", False
     )
 
 
@@ -328,7 +337,7 @@ def max_prompt_len() -> int:
 
 
 def gradient_checkpointing() -> bool:
-    return grid().topology().gradient_checkpointing
+    return getattr(grid().topology(), "gradient_checkpointing", False)
 
 
 def has_model_name(name: str) -> bool:
@@ -382,6 +391,15 @@ def parallelism_group():
     if _pgroups.get(_model_name, None) is None:
         raise RuntimeError(f"Parallelism group for model {_model_name} is not set.")
     return _pgroups[_model_name]
+
+
+def cpu_parallelism_group():
+    """Returns the GLOO 3D parallelism group of a specific model."""
+    if _model_name is None:
+        raise RuntimeError("Global constant `model_name` is accessed before set.")
+    if _cpu_pgroups.get(_model_name, None) is None:
+        raise RuntimeError(f"Parallelism group for model {_model_name} is not set.")
+    return _cpu_pgroups[_model_name]
 
 
 def parallelism_group_ranks():
@@ -453,6 +471,10 @@ def prev_pipe_stage():
     ) % pipe_parallel_world_size()
 
 
+def is_dp_head():
+    return is_last_pipe_stage() and model_parallel_rank() == 0
+
+
 def model_parallel_rank() -> int:
     """Return the rank inside the tensor parallelism group."""
     try:
@@ -488,6 +510,10 @@ def model_parallel_cpu_group():
 def tp_and_pp_group():
     """Used as the world group of vLLM."""
     return grid().get_model_parallel_group()
+
+
+def tp_and_pp_cpu_group():
+    return grid().ds_model_proc_group_gloo
 
 
 def tp_and_pp_rank():

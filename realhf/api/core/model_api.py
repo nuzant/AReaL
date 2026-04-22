@@ -3,17 +3,19 @@
 # Licensed under the Apache License, Version 2.0 (the "License").
 
 import abc
+import asyncio
 import dataclasses
 import keyword
-from typing import *
+from typing import Any, Callable, Dict, Hashable, List, Literal, Optional, Tuple, Union
 
+import aiohttp
 import numpy as np
 import torch
 import torch.utils.data
 import transformers
-from packaging.version import Version
 
 import realhf.base.logging as logging
+from realhf.api.cli_args import GenerationHyperparameters
 from realhf.api.core.config import (
     ModelAbstraction,
     ModelBackendAbstraction,
@@ -27,80 +29,136 @@ from realhf.base.recover import StepInfo
 logger = logging.getLogger("model_api")
 
 
+class ZeroTotalLossWeightException(Exception):
+    pass
+
+
 @dataclasses.dataclass
-class GenerationHyperparameters:
-    """Generation hyperparameters.
+class APIGenerateInput:
+    qid: Hashable
+    group_idx: int
+    prompt_ids: List[int]
+    input_ids: List[int]
+    gconfig: GenerationHyperparameters
+    stop_token_ids: List[int] = dataclasses.field(default_factory=list)
+    return_logprob: bool = False
 
-    We implement a customized generation function instead of using
-    HuggingFace's to support pipelined generation. As a result, advanced
-    generation techniques like diversity-promoting sampling or
-    repetition penalty are not supported during PPO training. However,
-    we do not find this to be a problem in practice. Increasing the
-    sampling temperature and enabling top-k/top-p sampling can produce
-    effective models.
 
-    :param n: The number of sequences to generate for this prompt.
-    :type n: int
-    :param max_new_tokens: The maximum number of new tokens to generate.
-    :type max_new_tokens: int
-    :param min_new_tokens: The minimum number of new tokens to generate.
-    :type min_new_tokens: int
-    :param greedy: Whether to use greedy decoding.
-    :type greedy: bool
-    :param top_k: The number of highest probability tokens to keep.
-    :type top_k: int
-    :param top_p: The cumulative probability of the highest probability
-        tokens to keep.
-    :type top_p: float
-    :param temperature: The temperature of the sampling process.
-    :type temperature: float
-    :param use_cuda_graph: Whether to use CUDA graph to reduce kernel
-        launch overhead during generation.
-    :type use_cuda_graph: bool
-    :param force_cudagraph_recapture: Whether to capture the CUDA graph
-        every time `generate` is called, even if the graph has been captured
-        before. This will introduce minor overhead but will release the
-        kvcache when not running generation.
-    :type force_cudagraph_recapture: bool
-    :param force_no_logits_mask: Whether to omit the logits mask. The logits
-        mask is produced when using top-k or top-p sampling, marking tokens
-        that are filtered out. This mask is used by the reference model and
-        the actor model during training to align inferred logits with those
-        during generation and produce accurate KLs. Using the logits mask with
-        top-k/top-p sampling greatly improves the stability of PPO training
-        by narrowing the action space. However, this benefit comes at the cost
-        of additional GPU memory usage. If this option is set to True, the
-        logits mask will be omitted to save GPU memory, which may lead to a
-        decrease in learning performance.
-    :type force_no_logits_mask: bool
-    """
+@dataclasses.dataclass
+class APIGenerateOutput:
+    qid: Hashable
+    group_idx: int
+    prompt_ids: List[int]
+    input_ids: List[int]
+    output_ids: List[int] = dataclasses.field(default_factory=list)
+    output_logprobs: List[int] = dataclasses.field(default_factory=list)
+    no_eos: bool = True
+    success: bool = False
+    latency: float = 0.0
+    ttft: float = 0.0  # Time to first token
+    itl: List[float] = dataclasses.field(
+        default_factory=list
+    )  # List of inter-token latencies
+    error: str = ""
 
-    n: int = 1
-    max_new_tokens: int = 256
-    min_new_tokens: int = 256
-    greedy: bool = False
-    top_p: float = 1.0
-    top_k: int = int(1e8)
-    temperature: float = 1.0
-    use_cuda_graph: bool = True
-    force_cudagraph_recapture: bool = True
-    force_no_logits_mask: bool = True
+    @classmethod
+    def from_input(cls, inp: APIGenerateInput):
+        return cls(
+            qid=inp.qid,
+            group_idx=inp.group_idx,
+            prompt_ids=inp.prompt_ids,
+            input_ids=inp.input_ids,
+        )
 
-    def __post_init__(self):
-        if self.temperature == 0.0:
-            self.greedy = True
-            self.temperature = 1.0
-        if self.top_p <= 0.0 or self.top_p > 1:
-            raise ValueError("top_p must be in (0.0, 1.0].")
-        if self.top_k <= 0:
-            raise ValueError("top_k must be a positive integer.")
+    @property
+    def output_len(self):
+        return len(self.output_ids)
 
-        if self.use_cuda_graph and Version(
-            Version(torch.__version__).base_version
-        ) < Version("2.3.0"):
-            raise ValueError(
-                f"To use CUDAGraph, ReaL's PyTorch version should be at least 2.3.0."
-            )
+    @property
+    def input_len(self):
+        return len(self.input_ids)
+
+    @property
+    def prompt_len(self):
+        return len(self.prompt_ids)
+
+    @property
+    def gen_len(self):
+        return self.output_len + self.input_len - self.prompt_len
+
+
+@dataclasses.dataclass
+class BundledGenerationOutputs:
+    qid: Hashable
+    prompt_ids: List[int]
+    seqs: List[List[int]]
+    no_eos: List[bool]
+
+    @classmethod
+    def from_single(cls, outputs: List[APIGenerateOutput]):
+        assert len(set(o.qid for o in outputs)) == 1
+        return cls(
+            qid=outputs[0].qid,
+            prompt_ids=outputs[0].prompt_ids,
+            seqs=[o.input_ids + o.output_ids for o in outputs],
+            no_eos=[o.no_eos for o in outputs],
+        )
+
+    @property
+    def seqlens(self):
+        return [len(seq) for seq in self.seqs]
+
+    @property
+    def prompt_len(self):
+        return len(self.prompt_ids)
+
+
+AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=6 * 60 * 60)
+
+
+class LLMAPIClient:
+    def __init__(
+        self, generate_url: str, update_weights_url: str, concurrency_limit: int = -1
+    ):
+        self.update_weights_url = update_weights_url
+        self.generate_url = generate_url
+        self.concurrency_limit = concurrency_limit
+
+        self.session: aiohttp.ClientSession
+        self.semaphore: asyncio.Semaphore
+
+    async def __aenter__(self):
+        conn = aiohttp.TCPConnector(limit=0, ttl_dns_cache=300)
+        self.session = aiohttp.ClientSession(
+            timeout=AIOHTTP_TIMEOUT,
+            connector=conn,
+            read_bufsize=1024 * 1024 * 10,
+        )
+        if self.concurrency_limit > 0:
+            self.semaphore = asyncio.Semaphore(self.concurrency_limit)
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        if self.session:
+            await self.session.close()
+
+    async def async_add_generate_request(
+        self, req: APIGenerateInput, stream: bool = True
+    ) -> APIGenerateOutput:
+
+        if self.concurrency_limit > 0:
+            async with self.semaphore:
+                return await self._do_generate(req, stream=stream)
+        else:
+            return await self._do_generate(req, stream=stream)
+
+    async def _do_generate(
+        self, req: APIGenerateInput, stream: bool = True
+    ) -> APIGenerateOutput:
+        raise NotImplementedError()
+
+    async def async_update_weights_from_disk(self, path):
+        raise NotImplementedError()
 
 
 @dataclasses.dataclass
@@ -334,7 +392,9 @@ class PipelinableEngine(abc.ABC):
         input_: SequenceSample,
         mb_spec: MicroBatchSpec,
         loss_fn: Callable[[torch.Tensor, SequenceSample], Tuple[torch.Tensor, Dict]],
+        loss_weight_fn: Callable[[torch.Tensor, SequenceSample], float],
         version_steps: int,
+        token_normalize_scope: Literal["global", "dp"] = "global",
     ) -> Tuple[torch.Tensor, Dict] | None:
         """Update the model with a batch of data and a loss function.
 
@@ -345,6 +405,10 @@ class PipelinableEngine(abc.ABC):
         :param loss_fn: The loss function. It takes the output of the forward pass and the
             input data, returning the loss and a dictionary of statistics.
         :type loss_fn: Callable[[torch.Tensor, SequenceSample], Tuple[torch.Tensor, Dict]]
+        :param loss_weight_fn: This function is used to calculate the number of valid tokens
+            when normalizing loss across micro batches and DP ranks. Can be `lambda: 1`
+            if just taking the average over batches.
+        :type loss_weight_fn: Callable[[torch.Tensor, SequenceSample], float]
         :param version_steps: The global step counter for this experiment,
             used by the backend to determine the learning rate schedule.
         :type version_steps: int
@@ -354,6 +418,11 @@ class PipelinableEngine(abc.ABC):
             which automatically schedules the forward and backward passes. For non-pipelined
             training, forward and backward passes are executed iteratively over mini-batches
             to accumulate gradients. If None, the batch will not be split.
+        :param global_normalize_scope: The scope of token-wise loss normalization. Choices:
+            global: average across all micro batches across DP ranks.
+            dp: average across micro batches in current DP rank.
+            Default to "global".
+        :type global_normalize_scope: Literal["global", "dp"]
         """
         raise NotImplementedError()
 

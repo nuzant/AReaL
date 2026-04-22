@@ -450,7 +450,7 @@ class RayController:
 
     It uses the basic Controller to configure workers. Besides, it
     launchs all remote workers using Ray, instead of submitting them to
-    the scheduelr.
+    the scheduler.
     """
 
     def __init__(self, experiment_name, trial_name):
@@ -618,7 +618,11 @@ class RayController:
             CLUSTER_SPEC_PATH=os.environ.get("CLUSTER_SPEC_PATH", ""),
             REAL_RECOVER_RUN=os.environ.get("REAL_RECOVER_RUN", ""),
             REAL_SAVE_RECOVER_STATES=os.environ.get("REAL_SAVE_RECOVER_STATES", ""),
-            REAL_MATH_METADATA_PATH=os.environ.get("REAL_MATH_METADATA_PATH", ""),
+            FUNCTIONCALL_SERVICE_DOMAIN=os.getenv("FUNCTIONCALL_SERVICE_DOMAIN", ""),
+            REAL_DUMP_TRACE=os.environ.get("REAL_DUMP_TRACE", "0"),
+            REAL_RECORD_PERFORMANCE=os.environ.get("REAL_RECORD_PERFORMANCE", "0"),
+            REAL_DUMP_MEMORY=os.environ.get("REAL_DUMP_MEMORY", "0"),
+            REAL_ETCD_ADDR=os.getenv("REAL_ETCD_ADDR", "localhost:2379"),
         )
         runtime_env = {
             "env_vars": env_vars,
